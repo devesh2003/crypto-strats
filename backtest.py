@@ -25,6 +25,7 @@ import argparse
 import importlib
 import sys
 import warnings
+from datetime import datetime
 
 import backtrader as bt
 
@@ -70,6 +71,19 @@ _TF_MAP = {
     "2h": (bt.TimeFrame.Minutes, 120),
     "4h": (bt.TimeFrame.Minutes, 240),
     "1d": (bt.TimeFrame.Days, 1),
+}
+
+# Bars per year for Sharpe annualization (crypto 24/7)
+_TF_SHARPE_FACTOR = {
+    "1m": 525_600,   # 60 * 24 * 365
+    "3m": 175_200,
+    "5m": 105_120,
+    "15m": 35_040,   # 4 * 24 * 365
+    "30m": 17_520,
+    "1h": 8_760,     # 24 * 365
+    "2h": 4_380,
+    "4h": 2_190,
+    "1d": 365,
 }
 
 
@@ -142,6 +156,17 @@ def main():
         help="Dotted path to a bt.Strategy class (e.g. strategies.MAStrategy)",
     )
 
+    # Strategy parameters (TP / SL shortcuts + generic --param)
+    parser.add_argument("--tp", type=float, default=None,
+                        help="Take-profit %% as decimal (e.g. 0.015 = 1.5%%). "
+                             "Passed to strategy as takeprofit_pct.")
+    parser.add_argument("--sl", type=float, default=None,
+                        help="Stop-loss %% as decimal (e.g. 0.006 = 0.6%%). "
+                             "Passed to strategy as stoploss_pct.")
+    parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                        help="Arbitrary strategy param, e.g. --param rsi_period=10. "
+                             "Numeric values are auto-cast. Can be repeated.")
+
     # Broker
     parser.add_argument("--cash", type=float, default=10_000, help="Starting cash (default: 10000)")
     parser.add_argument("--leverage", type=float, default=5, help="Leverage multiplier (default: 5)")
@@ -155,6 +180,11 @@ def main():
                         choices=["maker", "taker", "blended"],
                         help="Commission type (default: taker)")
 
+    # Slippage
+    parser.add_argument("--slippage", type=float, default=0.0001,
+                        help="Slippage per trade as fraction of price (default: 0.0001 = 0.01%%). "
+                             "Set to 0 for ideal fills.")
+
     # Output
     parser.add_argument("--plot", action="store_true", help="Show backtrader chart after run")
     parser.add_argument("--plot-file", default=None,
@@ -162,16 +192,21 @@ def main():
 
     args = parser.parse_args()
 
+    # Parse date range for feed filtering (must match --start/--end)
+    start_dt = datetime.strptime(args.start, "%Y-%m-%d")
+    end_dt = datetime.strptime(args.end, "%Y-%m-%d")
+
     # ------------------------------------------------------------------
     # 1. Ensure data is present (skip already-fetched days)
     # ------------------------------------------------------------------
     is_mtf = args.granular_tf is not None
 
     if is_mtf:
+        # In MTF mode we only need the granular data — the signal TF
+        # is resampled from it inside backtrader, so downloading signal-TF
+        # CSVs would be wasteful (and they're never loaded).
         print(f"[data] Ensuring {args.symbol} {args.granular_tf} data …")
         collect(args.symbol, args.start, args.end, args.granular_tf, args.data_dir)
-        print(f"[data] Ensuring {args.symbol} {args.signal_tf} data …")
-        collect(args.symbol, args.start, args.end, args.signal_tf, args.data_dir)
     else:
         print(f"[data] Ensuring {args.symbol} {args.signal_tf} data …")
         collect(args.symbol, args.start, args.end, args.signal_tf, args.data_dir)
@@ -186,7 +221,11 @@ def main():
     if is_mtf:
         # Granular data (e.g. 1m) is datas[0]
         bt_df_granular = load_bt_dataframe(args.symbol, args.granular_tf, args.data_dir)
-        data_granular = bt.feeds.PandasData(dataname=bt_df_granular)
+        data_granular = bt.feeds.PandasData(
+            dataname=bt_df_granular,
+            fromdate=start_dt,
+            todate=end_dt,
+        )
         cerebro.adddata(data_granular)
 
         # Resample to signal timeframe -> datas[1]
@@ -194,17 +233,68 @@ def main():
         cerebro.resampledata(data_granular, timeframe=tf, compression=comp)
     else:
         bt_df = load_bt_dataframe(args.symbol, args.signal_tf, args.data_dir)
-        cerebro.adddata(bt.feeds.PandasData(dataname=bt_df))
+        cerebro.adddata(bt.feeds.PandasData(
+            dataname=bt_df,
+            fromdate=start_dt,
+            todate=end_dt,
+        ))
 
     # ------------------------------------------------------------------
-    # 3. Strategy
+    # 3. Strategy (with optional param overrides)
     # ------------------------------------------------------------------
-    cerebro.addstrategy(strategy_cls)
+    strat_kwargs = {}
+
+    # MTF: single-TF strategies must use datas[1] for signals (not datas[0]).
+    # OversoldBounceMTFStrategy already uses datas[1]; others need target_data_index.
+    if is_mtf and hasattr(strategy_cls.params, "target_data_index"):
+        strat_kwargs["target_data_index"] = 1
+
+    # TP / SL shortcuts — only pass if the strategy declares the param
+    if args.tp is not None:
+        if hasattr(strategy_cls.params, "takeprofit_pct"):
+            strat_kwargs["takeprofit_pct"] = args.tp
+        else:
+            print(f"[warn] --tp ignored: {strategy_cls.__name__} has no 'takeprofit_pct' param")
+    if args.sl is not None:
+        if hasattr(strategy_cls.params, "stoploss_pct"):
+            strat_kwargs["stoploss_pct"] = args.sl
+        else:
+            print(f"[warn] --sl ignored: {strategy_cls.__name__} has no 'stoploss_pct' param")
+
+    # Generic --param KEY=VALUE overrides
+    for item in args.param:
+        if "=" not in item:
+            sys.exit(f"Bad --param format '{item}', expected KEY=VALUE")
+        key, val = item.split("=", 1)
+        if not hasattr(strategy_cls.params, key):
+            sys.exit(f"Strategy {strategy_cls.__name__} has no param '{key}'. "
+                     f"Declared params: {list(strategy_cls.params._getkeys())}")
+        # Auto-cast: bool, int, float, else string
+        v_lower = val.strip().lower()
+        if v_lower in ("true", "yes", "1"):
+            val = True
+        elif v_lower in ("false", "no", "0"):
+            val = False
+        else:
+            try:
+                val = int(val)
+            except ValueError:
+                try:
+                    val = float(val)
+                except ValueError:
+                    pass  # keep as string
+        strat_kwargs[key] = val
+
+    cerebro.addstrategy(strategy_cls, **strat_kwargs)
 
     # ------------------------------------------------------------------
     # 4. Broker config
     # ------------------------------------------------------------------
     cerebro.broker.setcash(args.cash)
+    if args.slippage > 0:
+        cerebro.broker.set_slippage_perc(args.slippage, slip_open=True,
+                                          slip_limit=False, slip_match=True,
+                                          slip_out=False)
     comminfo = BinanceFuturesCommInfo(
         commission_maker=args.commission_maker,
         commission_taker=args.commission_taker,
@@ -221,7 +311,17 @@ def main():
     # 5. Analyzers
     # ------------------------------------------------------------------
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trades")
-    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe", riskfreerate=0.0)
+    tf, comp = _parse_tf(args.signal_tf)
+    sharpe_factor = _TF_SHARPE_FACTOR.get(args.signal_tf, 252)
+    cerebro.addanalyzer(
+        bt.analyzers.SharpeRatio,
+        _name="sharpe",
+        riskfreerate=0.0,
+        timeframe=tf,
+        compression=comp,
+        factor=sharpe_factor,
+        annualize=True,
+    )
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
 
     # ------------------------------------------------------------------
@@ -235,7 +335,10 @@ def main():
     if is_mtf:
         print(f" Granular TF  : {args.granular_tf}")
     print(f" Strategy     : {args.strategy}")
+    if strat_kwargs:
+        print(f" Params       : {strat_kwargs}")
     print(f" Leverage     : {args.leverage}x")
+    print(f" Slippage     : {args.slippage*100:.3f}%")
     print(f" Starting cash: ${start_val:,.2f}")
     print(f"{'='*50}\n")
 
@@ -274,21 +377,28 @@ def main():
     # ------------------------------------------------------------------
     # 8. Plot (optional)
     # ------------------------------------------------------------------
-    if args.plot or args.plot_file:
-        import matplotlib
-        if args.plot_file and not args.plot:
-            matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+    PLOT_BAR_LIMIT = 50_000  # 1m data for ~35 days; avoid OOM/freeze
 
-        plt.rcParams["figure.figsize"] = [15, 12]
-        figs = cerebro.plot(iplot=False)
-        if args.plot_file:
-            for figlist in figs:
-                for fig in figlist:
-                    fig.savefig(args.plot_file, dpi=150, bbox_inches="tight")
-                    print(f"Chart saved to {args.plot_file}")
-        if args.plot:
-            plt.show()
+    if args.plot or args.plot_file:
+        n_bars = len(bt_df_granular) if is_mtf else len(bt_df)
+        if n_bars > PLOT_BAR_LIMIT:
+            print(f"[warn] Skipping plot: {n_bars:,} bars exceeds limit ({PLOT_BAR_LIMIT:,}). "
+                  f"Use a shorter date range or omit --plot/--plot-file.")
+        else:
+            import matplotlib
+            if args.plot_file and not args.plot:
+                matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            plt.rcParams["figure.figsize"] = [15, 12]
+            figs = cerebro.plot(iplot=False)
+            if args.plot_file:
+                for figlist in figs:
+                    for fig in figlist:
+                        fig.savefig(args.plot_file, dpi=150, bbox_inches="tight")
+                        print(f"Chart saved to {args.plot_file}")
+            if args.plot:
+                plt.show()
 
 
 if __name__ == "__main__":
